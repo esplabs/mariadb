@@ -1,0 +1,247 @@
+# security-baseline.yml — cheap, deterministic security checks on every esplabs repo.
+#
+# TEMPLATE (canonical source: esplabs/pai-personal agents/github-templates/security-baseline.yml)
+# ---------------------------------------------------------------------------------------------
+# Two checks, no LLM, about a minute of runner time:
+#   1. Secrets (gitleaks default rules). A secret added in a pull request always fails the check.
+#   2. Internal values (vera-corrections #20: nothing internal in code): LAN IPs, our hostnames, home
+#      coordinates, personal home paths, hardcoded Adja tenants, DB URLs with a user name. Config
+#      belongs in a file outside the repo; the repo carries a config.example with placeholders, which
+#      is allowlisted.
+#
+# When it runs: every pull request (scans only the commits in the PR), every push to the default
+# branch, and by hand (scans the whole tree; the `ref` input scans an older commit). Findings are
+# uploaded as the lex-findings-baseline artifact in the canonical schema; lex-findings-ingest (M4)
+# records them in security_findings, one row per rule and file, and they are routed to the repo's
+# owner as a work order (agents/tools/findings-to-orders.ts).
+#
+# BASELINE_MODE (below):
+#   enforce: new internal values in a PR, or any on the default branch, fail the check.
+#   report:  internal values are reported, never fail. For repos that still have violations, so main
+#            does not go red; flip to enforce once the repo is clean.
+# A secret in a PR diff fails in both modes. Secrets already in the tree are reported, not failed.
+#
+# Allow a real false positive: add `gitleaks:allow` as a comment on that line, or put its fingerprint
+# (shown in the job summary) in .gitleaksignore. Private repos skip prose docs (*.md, docs/) and data
+# logs (*.log, *.jsonl); public repos scan everything, rate findings HIGH and never echo the value.
+# Enrolment is tracked in the Estate OS SSOT (facts asset:estate:repo-security:<repo>, pipe
+# feed.secbaseline): a repo without this file shows as drift.
+
+name: Security Baseline
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to scan (default: the branch you run it on)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-baseline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BASELINE_MODE: report  # report | enforce (see header)
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || '' }}
+
+      - name: Install gitleaks 8.30.1
+        run: |
+          curl -sSL -o /tmp/gl.tgz "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz"
+          tar -xzf /tmp/gl.tgz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Write internal-values rules
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          cat > "$RUNNER_TEMP/internal-values.toml" <<'TOML'
+          title = "esplabs internal values (vera-corrections #20)"
+
+          [[rules]]
+          id = "internal-lan-ip"
+          description = "Private LAN address in code (config belongs in a file outside the repo)"
+          regex = '''\b(192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b'''
+          [[rules.allowlists]]
+          regexes = ['''\b10\.0\.0\.0\b''', '''\b192\.168\.0\.0\b''', '''\b172\.16\.0\.0\b''']
+
+          [[rules]]
+          id = "internal-hostname"
+          description = "Private hostname (home domain or a Mac's mDNS name) in code"
+          regex = '''(?i)\b([a-z0-9-]+\.)*jcoetzee\.com\b|\b[a-z0-9-]*(macbook|mac-mini|imac|ltmgl7h)[a-z0-9-]*\.local\b'''
+          keywords = ["jcoetzee", ".local"]
+
+          [[rules]]
+          id = "internal-home-coordinates"
+          description = "High-precision New Zealand latitude/longitude in code (home location)"
+          regex = '''-(3[4-9]|4[0-7])\.\d{4,}["']?\s*[,;/ ]\s*["']?\+?1(6[6-9]|7[0-8])\.\d{4,}|(?i)(lat|latitude)[a-z_]*["']?\s*[:=,]\s*["']?-(3[4-9]|4[0-7])\.\d{4,}|(?i)(lon|lng|long|longitude)[a-z_]*["']?\s*[:=,]\s*["']?1(6[6-9]|7[0-8])\.\d{4,}'''
+
+          [[rules]]
+          id = "internal-personal-path"
+          description = "Personal home-directory path in code"
+          regex = '''/Users/[A-Za-z0-9._-]+/|/home/pi/'''
+          keywords = ["/users/", "/home/pi/"]
+          [[rules.allowlists]]
+          regexes = ['''/Users/(runner|Shared|you|your-?user|username|USER|me|example|name|<[^>]*>)/''']
+
+          [[rules]]
+          id = "internal-adja-tenant"
+          description = "Adja tenant name hardcoded in code (read it from config)"
+          regex = '''(?i)\b(adja_?)?(write_|read_|profile_)?tenant(_?id|_?ids)?["']?\s*[:=]\s*["'][a-z][a-z0-9-]{2,40}["']'''
+          keywords = ["tenant"]
+          [[rules.allowlists]]
+          regexes = ['''["'](example|your-tenant|tenant|default|test|demo|placeholder)["']''']
+
+          [[rules]]
+          id = "internal-db-url-with-user"
+          description = "Database URL with a user name in code"
+          regex = '''(?i)\b(postgres(ql)?|mysql|mariadb|mongodb(\+srv)?|redis)://[A-Za-z0-9._%-]+(:[^@\s'"]*)?@[A-Za-z0-9._-]+'''
+          keywords = ["://"]
+          [[rules.allowlists]]
+          regexes = ['''://(postgres|user|username|test|tester|example|app|admin|root|USER|USERNAME|dbuser|db_user)(:[^@\s'"]*)?@(localhost|127\.0\.0\.1|postgres|db|host|HOST|example\.com|db\.example\.com)\b''', '''://\$\{?[A-Z_]+''', '''://<[^>]+>''']
+
+          [[allowlists]]
+          description = "Placeholders, generated files, the scanner's own config"
+          paths = [
+            '''(^|/)config\.example(\.[a-z]+)?$''',
+            '''\.example(\.[A-Za-z0-9]+)?$''',
+            '''(^|/)\.env\.(example|sample|template)$''',
+            '''(^|/)(package-lock\.json|bun\.lockb?|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|poetry\.lock|uv\.lock|Podfile\.lock|go\.sum)$''',
+            '''(^|/)(node_modules|vendor|\.venv|dist|build|target|\.next)/''',
+            '''(^|/)\.github/workflows/security-baseline\.yml$''',
+            '''(^|/)\.git/''',
+            '''(^|/)\.gitleaks(ignore|\.toml)$''',
+            '''\.(png|jpe?g|gif|ico|pdf|zip|gz|woff2?|ttf|mp[34]|mov|safetensors|bin|onnx|sqlite|db)$''',
+          ]
+          TOML
+          if [ "$REPO_PRIVATE" = "true" ]; then
+            cat >> "$RUNNER_TEMP/internal-values.toml" <<'TOML'
+
+          [[allowlists]]
+          description = "Private repo: prose docs and data logs may describe the estate; code and config may not"
+          paths = ['''\.(md|mdx|txt|rst|log|jsonl)$''', '''(^|/)docs?/''']
+          TOML
+          fi
+
+      - name: Scan
+        id: scan
+        env:
+          # GitHub context only through env, never interpolated into the script.
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          REPO: ${{ github.repository }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          IV_CFG="$RUNNER_TEMP/internal-values.toml"
+          OUT="$RUNNER_TEMP/baseline"; mkdir -p "$OUT"   # reports outside the tree, so one scan never reads another's report
+          SHA=$(git rev-parse HEAD)
+          common=(--no-banner --exit-code 0 --report-format json --log-level warn --max-target-megabytes 5)
+          if [ "$EVENT" = "pull_request" ]; then
+            SCOPE="commits in this pull request"
+            gitleaks git . "${common[@]}" --redact --log-opts "--no-merges ${BASE_SHA}..${HEAD_SHA}" --report-path "$OUT/secrets.json"
+            gitleaks git . "${common[@]}" -c "$IV_CFG" --log-opts "--no-merges ${BASE_SHA}..${HEAD_SHA}" --report-path "$OUT/iv.json"
+          else
+            SCOPE="whole tree at ${SHA:0:7}"
+            gitleaks dir . "${common[@]}" --redact --report-path "$OUT/secrets.json"
+            gitleaks dir . "${common[@]}" -c "$IV_CFG" --report-path "$OUT/iv.json"
+          fi
+          for f in "$OUT/secrets.json" "$OUT/iv.json"; do [ -s "$f" ] || echo '[]' > "$f"; done
+          # gitleaks git reports a hit once per commit: keep one per rule, file and line. Drop .git internals.
+          jq '[.[] | select(.File | test("(^|/)\\.git/") | not)] | unique_by([.RuleID, .File, .StartLine])' "$OUT/iv.json" > "$OUT/iv.u.json"
+          jq '[.[] | select(.File | test("(^|/)\\.git/") | not)] | unique_by([.RuleID, .File, .StartLine])' "$OUT/secrets.json" > "$OUT/secrets.u.json"
+
+          IV_SEV=medium; SHOW=true
+          if [ "$REPO_PRIVATE" != "true" ]; then IV_SEV=high; SHOW=false; fi   # public: HIGH, never echo the value
+          SEC_SEV=high; [ "$EVENT" = "pull_request" ] && SEC_SEV=critical
+
+          # One finding per rule and file. The finding text is stable across runs so the ingest dedupes it.
+          canon() {  # $1 report, $2 scanner, $3 severity, $4 show values
+            jq --arg scanner "$2" --arg sev "$3" --argjson show "$4" --arg repo "$REPO" --arg run "$RUN_ID" \
+               --arg sha "$SHA" --argjson pr "$PR_NUMBER" '
+              { schema_version: "1", run_id: $run, repo: $repo, pr_number: $pr, commit_sha: $sha, scanner: $scanner,
+                findings: (group_by([.RuleID, .File]) | map({
+                  scanner: $scanner, model_id: "gitleaks-8.30.1", rule_id: .[0].RuleID, repo: $repo,
+                  file_path: (.[0].File | sub("^\\./"; "")), line_number: 0, severity: $sev,
+                  category: (if $scanner == "internal-values" then "internal-value" else "A02-cryptographic-failures" end),
+                  finding: ((if $scanner == "internal-values" then .[0].Description else "Possible secret (" + .[0].RuleID + ")" end)
+                            + " in " + (.[0].File | sub("^\\./"; ""))),
+                  recommendation: ("\(length) hit(s), lines " + (map(.StartLine) | unique | .[:15] | map(tostring) | join(","))
+                    + (if $show then "; values: " + (map(.Match[:80]) | unique | .[:5] | join(" | ")) else "" end)
+                    + (if $scanner == "internal-values" then ". Move it to the config file outside the repo (config.example keeps a placeholder)."
+                       else ". Remove it, rotate the credential, keep it in the ESPLabs Vault." end)),
+                  reference: "vera-corrections #20" })) }' "$1"
+          }
+          canon "$OUT/iv.u.json" internal-values "$IV_SEV" "$SHOW" > "$OUT/lex-findings-internal-values.json"
+          canon "$OUT/secrets.u.json" gitleaks "$SEC_SEV" false > "$OUT/lex-findings-secrets.json"
+
+          IV_N=$(jq length "$OUT/iv.u.json"); SEC_N=$(jq length "$OUT/secrets.u.json")
+          {
+            echo "## Security baseline: ${SCOPE} (mode ${BASELINE_MODE})"
+            echo ""
+            echo "- Secrets: **${SEC_N}**"
+            echo "- Internal values: **${IV_N}** (severity ${IV_SEV})"
+            echo ""
+            if [ "$IV_N" -gt 0 ]; then
+              echo "| rule | file:line | value | fingerprint |"
+              echo "|---|---|---|---|"
+              jq -r --argjson show "$SHOW" '.[:200][] | "| \(.RuleID) | `\(.File | sub("^\\./"; "")):\(.StartLine)` | \(if $show then "`" + (.Match[:60] | gsub("\\|"; "/")) + "`" else "(hidden: public repo)" end) | `\(.Fingerprint)` |"' "$OUT/iv.u.json"
+              echo ""
+            fi
+            if [ "$SEC_N" -gt 0 ]; then
+              echo "| secret rule | file:line | fingerprint |"
+              echo "|---|---|---|"
+              jq -r '.[:100][] | "| \(.RuleID) | `\(.File | sub("^\\./"; "")):\(.StartLine)` | `\(.Fingerprint)` |"' "$OUT/secrets.u.json"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SHOW" = "true" ]; then
+            jq -r '.[:200][] | "internal-value: \(.RuleID) \(.File | sub("^\\./"; "")):\(.StartLine) \(.Match[:60])"' "$OUT/iv.u.json"
+          else
+            jq -r '.[:200][] | "internal-value: \(.RuleID) \(.File | sub("^\\./"; "")):\(.StartLine)"' "$OUT/iv.u.json"
+          fi
+          jq -r '.[:100][] | "secret: \(.RuleID) \(.File | sub("^\\./"; "")):\(.StartLine)"' "$OUT/secrets.u.json"
+          echo "iv=${IV_N}" >> "$GITHUB_OUTPUT"; echo "sec=${SEC_N}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: lex-findings-baseline
+          path: ${{ runner.temp }}/baseline/lex-findings-*.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Gate
+        env:
+          EVENT: ${{ github.event_name }}
+          IV_N: ${{ steps.scan.outputs.iv }}
+          SEC_N: ${{ steps.scan.outputs.sec }}
+        run: |
+          if [ -z "${IV_N}" ] || [ -z "${SEC_N}" ]; then echo "::error::scan produced no counts"; exit 1; fi
+          if [ "$EVENT" = "pull_request" ] && [ "$SEC_N" -gt 0 ]; then
+            echo "::error::${SEC_N} secret(s) added in this pull request. Remove, rotate, keep it in the ESPLabs Vault."; exit 1
+          fi
+          if [ "$BASELINE_MODE" = "enforce" ] && [ "$IV_N" -gt 0 ]; then
+            echo "::error::${IV_N} internal value(s) in code (vera-corrections #20). Move them to the config file outside the repo."; exit 1
+          fi
+          if [ "$IV_N" -gt 0 ]; then echo "::warning::${IV_N} internal value(s) reported (mode ${BASELINE_MODE})."; fi
+          echo "baseline ok: secrets=${SEC_N} internal_values=${IV_N} mode=${BASELINE_MODE}"
